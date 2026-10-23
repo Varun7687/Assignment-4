@@ -1,0 +1,16 @@
+# Cache, state, saved plans and environment-specific variables
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
+*.pem
+*.key
+.env
+# Do not ignore .terraform.lock.hcl.

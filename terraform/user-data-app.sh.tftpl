@@ -1,0 +1,165 @@
+#!/bin/bash
+set -Eeuo pipefail
+exec > >(tee -a /var/log/assignment-4-bootstrap.log | logger -t assignment-4-bootstrap -s 2>/dev/console) 2>&1
+
+APP_USER="inventory-app"
+APP_GROUP="inventory-app"
+APP_ROOT="/opt/assignment-4-inventory-app"
+APP_DIR="$${APP_ROOT}/app"
+SQL_DIR="$${APP_ROOT}/sql"
+VENV="$${APP_ROOT}/venv"
+CONFIG_DIR="/etc/inventory-app"
+CONFIG_FILE="$${CONFIG_DIR}/inventory.env"
+SERVICE="inventory-app"
+AWS_REGION="${aws_region}"
+GITHUB_REPO_URL="${github_repo_url}"
+GITHUB_BRANCH="${github_branch}"
+RDS_MASTER_SECRET_ARN="${rds_master_secret_arn}"
+APP_DB_SECRET_ARN="${app_db_secret_arn}"
+RDS_HOST="${rds_host}"
+RDS_PORT="${rds_port}"
+
+retry() {
+  local attempts="$1"; shift
+  local n=1
+  until "$@"; do
+    if (( n >= attempts )); then return 1; fi
+    sleep 15
+    n=$((n + 1))
+  done
+}
+
+# Amazon Linux 2023 package names.
+dnf install -y git python3 python3-pip mariadb105 jq awscli-2
+
+getent group "$${APP_GROUP}" >/dev/null || groupadd --system "$${APP_GROUP}"
+id "$${APP_USER}" >/dev/null 2>&1 || useradd --system --gid "$${APP_GROUP}" \
+  --home-dir /var/lib/inventory-app --create-home --shell /sbin/nologin "$${APP_USER}"
+
+install -d -o root -g root -m 0755 "$${APP_ROOT}" "$${APP_DIR}" "$${SQL_DIR}"
+install -d -o root -g "$${APP_GROUP}" -m 0750 "$${CONFIG_DIR}"
+
+# Fetch the application from the public GitHub repository.
+SOURCE_DIR="$${APP_ROOT}/github-source"
+rm -rf "$${SOURCE_DIR}"
+git clone --depth 1 --branch "$${GITHUB_BRANCH}" "$${GITHUB_REPO_URL}" "$${SOURCE_DIR}"
+test -f "$${SOURCE_DIR}/app.py"
+test -f "$${SOURCE_DIR}/requirements.txt"
+test -f "$${SOURCE_DIR}/templates/index.html"
+install -o root -g root -m 0644 "$${SOURCE_DIR}/app.py" "$${APP_DIR}/app.py"
+install -o root -g root -m 0644 "$${SOURCE_DIR}/requirements.txt" "$${APP_DIR}/requirements.txt"
+install -d -o root -g root -m 0755 "$${APP_DIR}/templates"
+tar -C "$${SOURCE_DIR}/templates" -cf - . | tar -C "$${APP_DIR}/templates" -xf -
+rm -rf "$${SOURCE_DIR}"
+
+# SQL is bundled from the sibling sql/ directory by Terraform.
+printf '%s' '${schema_b64}' | base64 -d > "$${SQL_DIR}/schema.sql"
+printf '%s' '${seed_b64}' | base64 -d > "$${SQL_DIR}/seed.sql"
+
+# Bootstrap revision: RSA-enabled database authentication and health-check retries.
+# GitHub requirements.txt must contain PyMySQL[rsa]==1.1.1.
+python3 -m venv "$${VENV}"
+"$${VENV}/bin/pip" install --upgrade pip
+"$${VENV}/bin/pip" install -r "$${APP_DIR}/requirements.txt"
+
+# RDS-managed master credentials and a separate least-privilege app secret.
+get_master_secret() {
+  aws secretsmanager get-secret-value --region "$${AWS_REGION}" \
+    --secret-id "$${RDS_MASTER_SECRET_ARN}" --query SecretString --output text
+}
+get_app_secret() {
+  aws secretsmanager get-secret-value --region "$${AWS_REGION}" \
+    --secret-id "$${APP_DB_SECRET_ARN}" --query SecretString --output text
+}
+MASTER_JSON="$(retry 30 get_master_secret)"
+APP_JSON="$(retry 30 get_app_secret)"
+MASTER_USER="$(jq -r .username <<<"$${MASTER_JSON}")"
+MASTER_PASSWORD="$(jq -r .password <<<"$${MASTER_JSON}")"
+APP_USER_DB="$(jq -r .username <<<"$${APP_JSON}")"
+APP_PASSWORD="$(jq -r .password <<<"$${APP_JSON}")"
+
+# Escape backslashes and double quotes for MySQL's quoted option-file format.
+MYSQL_CNF_PASSWORD="$(printf '%s' "$MASTER_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+
+# Create the temporary credential file with private permissions from the outset.
+(
+  umask 077
+  cat > /tmp/inventory-admin.cnf <<CNF
+[client]
+host=$${RDS_HOST}
+port=$${RDS_PORT}
+user=$${MASTER_USER}
+password="$MYSQL_CNF_PASSWORD"
+connect-timeout=10
+CNF
+)
+unset MYSQL_CNF_PASSWORD
+chmod 0600 /tmp/inventory-admin.cnf
+
+# Wait for RDS, then create the database objects idempotently.
+mysql_ready() {
+  mysql --defaults-extra-file=/tmp/inventory-admin.cnf \
+    --batch --skip-column-names -e 'SELECT 1' >/dev/null 2>&1
+}
+retry 40 mysql_ready
+mysql --defaults-extra-file=/tmp/inventory-admin.cnf < "$${SQL_DIR}/schema.sql"
+mysql --defaults-extra-file=/tmp/inventory-admin.cnf < "$${SQL_DIR}/seed.sql"
+
+# The app password is generated as alphanumeric; keep that generator setting unchanged.
+mysql --defaults-extra-file=/tmp/inventory-admin.cnf <<SQL
+CREATE USER IF NOT EXISTS '$${APP_USER_DB}'@'%' IDENTIFIED BY '$${APP_PASSWORD}';
+ALTER USER '$${APP_USER_DB}'@'%' IDENTIFIED BY '$${APP_PASSWORD}';
+GRANT SELECT, INSERT ON inventory.items TO '$${APP_USER_DB}'@'%';
+FLUSH PRIVILEGES;
+SQL
+rm -f /tmp/inventory-admin.cnf
+
+cat > "$${CONFIG_FILE}" <<ENV
+DB_HOST=$${RDS_HOST}
+DB_PORT=$${RDS_PORT}
+DB_NAME=inventory
+DB_USER=$${APP_USER_DB}
+DB_PASSWORD=$${APP_PASSWORD}
+APP_SECRET_KEY=$${APP_PASSWORD}
+ENV
+unset MASTER_PASSWORD APP_PASSWORD MASTER_JSON APP_JSON
+chown "$${APP_USER}:$${APP_GROUP}" "$${CONFIG_FILE}"
+chmod 0400 "$${CONFIG_FILE}"
+
+chown -R root:root "$${APP_ROOT}"
+find "$${APP_ROOT}" -type d -exec chmod 0755 {} +
+
+cat > "/etc/systemd/system/$${SERVICE}.service" <<UNIT
+[Unit]
+Description=Northwind inventory Flask app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$${APP_USER}
+Group=$${APP_GROUP}
+WorkingDirectory=$${APP_DIR}
+EnvironmentFile=$${CONFIG_FILE}
+ExecStart=$${VENV}/bin/gunicorn --workers 2 --bind 0.0.0.0:80 app:app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+chmod 0644 "/etc/systemd/system/$${SERVICE}.service"
+systemctl daemon-reload
+systemctl enable --now "$${SERVICE}.service"
+# Gunicorn can take a moment to bind port 80 after systemctl returns.
+app_ready() {
+  curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+    http://127.0.0.1/health >/dev/null
+}
+retry 20 app_ready
+systemctl is-active --quiet "$${SERVICE}.service"
+
+echo "Assignment 4 application bootstrap complete."

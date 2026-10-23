@@ -1,0 +1,18 @@
+# Example only. Review values before any new deployment.
+aws_region         = "us-east-1"
+project_name       = "northwind-assignment-4"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# Bootstrap expects app.py, requirements.txt and templates/ at the repo root.
+github_repo_url = "https://github.com/Varun7687/Assignment-4.git"
+github_branch   = "main"
+
+single_nat_gateway = true
+notification_email = ""
+
+# Empty selects the Flask bootstrap in user-data-app.sh.tftpl.
+# Do not supply the Apache placeholder for the final app deployment.
+app_user_data = ""
+
+# Engine-version and parameter-group family must be compatible.
+# Confirm the live/lab engine before pinning mysql_engine_version.

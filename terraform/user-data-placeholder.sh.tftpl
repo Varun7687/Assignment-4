@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+
+# This is a safe infrastructure-only placeholder. Replace it with the real
+# Flask deployment user data through var.app_user_data before final testing.
+dnf install -y httpd
+
+cat > /var/www/html/index.html <<'HTML'
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Inventory app infrastructure ready</title></head>
+  <body>
+    <h1>${project_name}</h1>
+    <p>EC2 and the ALB are reachable. Deploy the Flask application separately.</p>
+  </body>
+</html>
+HTML
+
+echo "ok" > /var/www/html/health
+systemctl enable --now httpd
+curl --fail --silent http://127.0.0.1/health >/dev/null
