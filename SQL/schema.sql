@@ -1,0 +1,17 @@
+CREATE DATABASE IF NOT EXISTS inventory
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+USE inventory;
+
+CREATE TABLE IF NOT EXISTS items (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  item_name VARCHAR(160) NOT NULL,
+  sku VARCHAR(64) NOT NULL,
+  quantity INT UNSIGNED NOT NULL DEFAULT 0,
+  warehouse_location VARCHAR(120) NOT NULL,
+  last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_items_sku (sku),
+  KEY ix_items_location (warehouse_location)
+) ENGINE=InnoDB;
